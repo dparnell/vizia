@@ -35,6 +35,8 @@ where
             TourDirection::Entering => {
                 if self.tree.is_ignored(node) {
                     (None, TourStep::EnterFirstChild)
+                } else if self.tree.is_window(node) {
+                    (None, TourStep::LeaveCurrent)
                 } else {
                     (Some(node), TourStep::LeaveCurrent)
                 }

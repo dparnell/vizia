@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 
-use crate::{DoubleEndedTreeTour, LayoutChildIterator, TourDirection, TourStep, Tree};
+use crate::{
+    ChildIterator, DoubleEndedTreeTour, LayoutChildIterator, TourDirection, TourStep, Tree,
+};
 use vizia_id::GenerationalId;
 
 /// Iterator for iterating through the tree in depth first preorder.
@@ -84,7 +86,7 @@ where
     type Item = I;
     fn next(&mut self) -> Option<I> {
         if let Some(item) = self.queue.pop_front() {
-            let child_iter = LayoutChildIterator::new(self.tree, item);
+            let child_iter = ChildIterator::new(self.tree, item);
             for child in child_iter {
                 self.queue.push_back(child);
             }
