@@ -61,13 +61,13 @@ pub(crate) fn layout_system(cx: &mut Context) {
                     cx.text_context.sync_styles(entity, cx.style);
                     let (text_width, text_height) =
                         cx.text_context.with_buffer(entity, |fs, buf| {
-                            buf.set_size(fs, width, f32::MAX);
+                            buf.set_size(fs, Some(width), Some(f32::MAX));
                             let w = buf
                                 .layout_runs()
                                 .filter_map(|r| (!r.line_w.is_nan()).then_some(r.line_w))
                                 .max_by(|f1, f2| f1.partial_cmp(f2).unwrap())
                                 .unwrap_or_default();
-                            let h = buf.layout_runs().len() as f32 * buf.metrics().line_height;
+                            let h = buf.layout_runs().count() as f32 * buf.metrics().line_height;
                             (w, h)
                         });
                     cx.text_context.set_bounds(
@@ -102,7 +102,7 @@ pub(crate) fn layout_system(cx: &mut Context) {
                     let width = width.ceil() - child_left - child_right - 2.0 * border_width;
 
                     cx.text_context.with_buffer(entity, |fs, buffer| {
-                        buffer.set_size(fs, width, f32::MAX);
+                        buffer.set_size(fs, Some(width), Some(f32::MAX));
                     })
                 }
             }

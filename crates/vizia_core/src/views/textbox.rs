@@ -4,7 +4,7 @@ use crate::prelude::*;
 use crate::text::{enforce_text_bounds, ensure_visible, Direction, Movement};
 use crate::views::scrollview::SCROLL_SENSITIVITY;
 use accesskit::{ActionData, ActionRequest, TextDirection, TextPosition, TextSelection};
-use cosmic_text::{Action, Cursor, Edit, Editor, FontSystem, Selection};
+use cosmic_text::{Action, Cursor, Edit, Editor, FontSystem, Motion, Selection};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Events for modifying a textbox.
@@ -302,26 +302,26 @@ where
             buf.action(
                 fs,
                 match movement {
-                    Movement::Grapheme(Direction::Upstream) => Action::Previous,
-                    Movement::Grapheme(Direction::Downstream) => Action::Next,
-                    Movement::Grapheme(Direction::Left) => Action::Left,
-                    Movement::Grapheme(Direction::Right) => Action::Right,
-                    Movement::Word(Direction::Upstream) => Action::PreviousWord,
-                    Movement::Word(Direction::Downstream) => Action::NextWord,
-                    Movement::Word(Direction::Left) => Action::LeftWord,
-                    Movement::Word(Direction::Right) => Action::RightWord,
-                    Movement::Line(Direction::Upstream) => Action::Up,
-                    Movement::Line(Direction::Downstream) => Action::Down,
-                    Movement::LineStart => Action::Home,
-                    Movement::LineEnd => Action::End,
+                    Movement::Grapheme(Direction::Upstream) => Action::Motion(Motion::Previous),
+                    Movement::Grapheme(Direction::Downstream) => Action::Motion(Motion::Next),
+                    Movement::Grapheme(Direction::Left) => Action::Motion(Motion::Left),
+                    Movement::Grapheme(Direction::Right) => Action::Motion(Motion::Right),
+                    Movement::Word(Direction::Upstream) => Action::Motion(Motion::PreviousWord),
+                    Movement::Word(Direction::Downstream) => Action::Motion(Motion::NextWord),
+                    Movement::Word(Direction::Left) => Action::Motion(Motion::LeftWord),
+                    Movement::Word(Direction::Right) => Action::Motion(Motion::RightWord),
+                    Movement::Line(Direction::Upstream) => Action::Motion(Motion::Up),
+                    Movement::Line(Direction::Downstream) => Action::Motion(Motion::Down),
+                    Movement::LineStart => Action::Motion(Motion::Home),
+                    Movement::LineEnd => Action::Motion(Motion::End),
                     Movement::Page(dir) => {
                         let parent = cx.current.parent(cx.tree).unwrap();
                         let parent_bounds = *cx.cache.bounds.get(parent).unwrap();
                         let sign = if let Direction::Upstream = dir { -1 } else { 1 };
-                        Action::Vertical(sign * parent_bounds.h as i32)
+                        Action::Motion(Motion::Vertical(sign * parent_bounds.h as i32))
                     }
-                    Movement::Body(Direction::Upstream) => Action::BufferStart,
-                    Movement::Body(Direction::Downstream) => Action::BufferEnd,
+                    Movement::Body(Direction::Upstream) => Action::Motion(Motion::BufferStart),
+                    Movement::Body(Direction::Downstream) => Action::Motion(Motion::BufferEnd),
                     _ => return,
                 },
             );
@@ -332,27 +332,27 @@ where
 
     fn select_all(&mut self, cx: &mut EventContext) {
         cx.text_context.with_editor(cx.current, |fs, buf| {
-            buf.action(fs, Action::BufferStart);
+            buf.action(fs, Action::Motion(Motion::BufferStart));
             buf.set_selection(Selection::Normal(buf.cursor()));
-            buf.action(fs, Action::BufferEnd);
+            buf.action(fs, Action::Motion(Motion::BufferEnd));
         });
         cx.needs_redraw();
     }
 
     fn select_word(&mut self, cx: &mut EventContext) {
         cx.text_context.with_editor(cx.current, |fs, buf| {
-            buf.action(fs, Action::PreviousWord);
+            buf.action(fs, Action::Motion(Motion::PreviousWord));
             buf.set_selection(Selection::Normal(buf.cursor()));
-            buf.action(fs, Action::NextWord);
+            buf.action(fs, Action::Motion(Motion::NextWord));
         });
         cx.needs_redraw();
     }
 
     fn select_paragraph(&mut self, cx: &mut EventContext) {
         cx.text_context.with_editor(cx.current, |fs, buf| {
-            buf.action(fs, Action::ParagraphStart);
+            buf.action(fs, Action::Motion(Motion::ParagraphStart));
             buf.set_selection(Selection::Normal(buf.cursor()));
-            buf.action(fs, Action::ParagraphEnd);
+            buf.action(fs, Action::Motion(Motion::ParagraphEnd));
         });
         cx.needs_redraw();
     }
@@ -394,7 +394,7 @@ where
         let child_top = child_top.to_px(logical_parent_height, 0.0) * cx.scale_factor();
 
         let total_height = cx.text_context.with_buffer(cx.current, |_, buffer| {
-            buffer.layout_runs().len() as f32 * buffer.metrics().line_height
+            buffer.layout_runs().count() as f32 * buffer.metrics().line_height
         });
 
         let x = x - bounds.x - self.transform.0 - child_left;
@@ -559,129 +559,131 @@ where
             let mut current_cursor = 0;
             let mut prev_line_index = std::usize::MAX;
 
-            for (index, line) in editor.buffer().layout_runs().enumerate() {
-                let text = line.text;
+            editor.with_buffer(|buffer| {
+                for (index, line) in buffer.layout_runs().enumerate() {
+                    let text = line.text;
 
-                // We need a child node per line
-                let mut line_node = AccessNode::new_from_parent(node_id, index);
-                line_node.set_role(Role::InlineTextBox);
+                    // We need a child node per line
+                    let mut line_node = AccessNode::new_from_parent(node_id, index);
+                    line_node.set_role(Role::InlineTextBox);
 
-                let line_height = editor.buffer().metrics().line_height;
-                line_node.set_bounds(BoundingBox {
-                    x: bounds.x,
-                    y: bounds.y + line.line_y - editor.buffer().metrics().font_size,
-                    w: line.line_w,
-                    h: line_height,
-                });
-                line_node.set_text_direction(if line.rtl {
-                    TextDirection::RightToLeft
-                } else {
-                    TextDirection::LeftToRight
-                });
+                    let line_height = buffer.metrics().line_height;
+                    line_node.set_bounds(BoundingBox {
+                        x: bounds.x,
+                        y: bounds.y + line.line_y - buffer.metrics().font_size,
+                        w: line.line_w,
+                        h: line_height,
+                    });
+                    line_node.set_text_direction(if line.rtl {
+                        TextDirection::RightToLeft
+                    } else {
+                        TextDirection::LeftToRight
+                    });
 
-                let mut character_lengths = Vec::with_capacity(line.glyphs.len());
-                let mut character_positions = Vec::with_capacity(line.glyphs.len());
-                let mut character_widths = Vec::with_capacity(line.glyphs.len());
+                    let mut character_lengths = Vec::with_capacity(line.glyphs.len());
+                    let mut character_positions = Vec::with_capacity(line.glyphs.len());
+                    let mut character_widths = Vec::with_capacity(line.glyphs.len());
 
-                // Get the actual text in the line
-                let first_glyph_pos =
-                    line.glyphs.first().map(|glyph| glyph.start).unwrap_or_default();
-                let last_glyph_pos = line.glyphs.last().map(|glyph| glyph.end).unwrap_or_default();
+                    // Get the actual text in the line
+                    let first_glyph_pos =
+                        line.glyphs.first().map(|glyph| glyph.start).unwrap_or_default();
+                    let last_glyph_pos = line.glyphs.last().map(|glyph| glyph.end).unwrap_or_default();
 
-                let mut line_text = text[first_glyph_pos..last_glyph_pos].to_owned();
+                    let mut line_text = text[first_glyph_pos..last_glyph_pos].to_owned();
 
-                let word_lengths =
-                    line_text.unicode_words().map(|word| word.len() as u8).collect::<Vec<_>>();
+                    let word_lengths =
+                        line_text.unicode_words().map(|word| word.len() as u8).collect::<Vec<_>>();
 
-                let mut line_length = 0;
+                    let mut line_length = 0;
 
-                for glyph in line.glyphs.iter() {
-                    let length = (glyph.end - glyph.start) as u8;
+                    for glyph in line.glyphs.iter() {
+                        let length = (glyph.end - glyph.start) as u8;
 
-                    line_length += length as usize;
+                        line_length += length as usize;
 
-                    let position = glyph.x;
-                    let width = glyph.w;
+                        let position = glyph.x;
+                        let width = glyph.w;
 
-                    character_lengths.push(length);
-                    character_positions.push(position);
-                    character_widths.push(width);
-                }
-
-                // Cosmic strips the newlines but accesskit needs them so we append them back in if line originally ended with a newline
-                // If the last glyph position is equal to the end of the buffer line then this layout run is the last one and ends in a newline.
-                if last_glyph_pos == line.text.len() {
-                    line_text += "\n";
-                    character_lengths.push(1);
-                    character_positions.push(line.line_w);
-                    character_widths.push(0.0);
-                }
-
-                // TODO: Might need to append any spaces that were stripped during layout. This can be done by
-                // figuring out if the start of the next line is greater than the end of the current line as long
-                // as the lines have the same `line_i`. This will require a peekable iterator loop.
-
-                line_node.set_value(line_text.into_boxed_str());
-                line_node.set_character_lengths(character_lengths.into_boxed_slice());
-                line_node.set_character_positions(character_positions.into_boxed_slice());
-                line_node.set_character_widths(character_widths.into_boxed_slice());
-                line_node.set_word_lengths(word_lengths.into_boxed_slice());
-
-                if line.line_i != prev_line_index {
-                    current_cursor = 0;
-                }
-
-                if line.line_i == cursor.line {
-                    if prev_line_index != line.line_i {
-                        if cursor.index <= line_length {
-                            selection_active_line = line_node.node_id();
-                            selection_active_cursor = cursor.index;
-                        }
-                    } else if cursor.index > current_cursor {
-                        selection_active_line = line_node.node_id();
-                        selection_active_cursor = cursor.index - current_cursor;
+                        character_lengths.push(length);
+                        character_positions.push(position);
+                        character_widths.push(width);
                     }
-                }
 
-                // Check if the current line contains the cursor or selection
-                // This is a mess because a line happens due to soft and hard breaks but
-                // the cursor and selected indices are relative to the lines caused by hard breaks only.
-                if selection == Selection::None {
-                    selection = Selection::Normal(cursor);
-                }
-                if let Selection::Normal(selection) = selection {
-                    if line.line_i == selection.line {
-                        // A previous line index different to the current means that the current line follows a hard break
+                    // Cosmic strips the newlines but accesskit needs them so we append them back in if line originally ended with a newline
+                    // If the last glyph position is equal to the end of the buffer line then this layout run is the last one and ends in a newline.
+                    if last_glyph_pos == line.text.len() {
+                        line_text += "\n";
+                        character_lengths.push(1);
+                        character_positions.push(line.line_w);
+                        character_widths.push(0.0);
+                    }
+
+                    // TODO: Might need to append any spaces that were stripped during layout. This can be done by
+                    // figuring out if the start of the next line is greater than the end of the current line as long
+                    // as the lines have the same `line_i`. This will require a peekable iterator loop.
+
+                    line_node.set_value(line_text.into_boxed_str());
+                    line_node.set_character_lengths(character_lengths.into_boxed_slice());
+                    line_node.set_character_positions(character_positions.into_boxed_slice());
+                    line_node.set_character_widths(character_widths.into_boxed_slice());
+                    line_node.set_word_lengths(word_lengths.into_boxed_slice());
+
+                    if line.line_i != prev_line_index {
+                        current_cursor = 0;
+                    }
+
+                    if line.line_i == cursor.line {
                         if prev_line_index != line.line_i {
-                            if selection.index <= line_length {
-                                selection_anchor_line = line_node.node_id();
-                                selection_anchor_cursor = selection.index;
+                            if cursor.index <= line_length {
+                                selection_active_line = line_node.node_id();
+                                selection_active_cursor = cursor.index;
                             }
-                        } else if selection.index > current_cursor {
-                            selection_anchor_line = line_node.node_id();
-                            selection_anchor_cursor = selection.index - current_cursor;
+                        } else if cursor.index > current_cursor {
+                            selection_active_line = line_node.node_id();
+                            selection_active_cursor = cursor.index - current_cursor;
                         }
                     }
+
+                    // Check if the current line contains the cursor or selection
+                    // This is a mess because a line happens due to soft and hard breaks but
+                    // the cursor and selected indices are relative to the lines caused by hard breaks only.
+                    if selection == Selection::None {
+                        selection = Selection::Normal(cursor);
+                    }
+                    if let Selection::Normal(selection) = selection {
+                        if line.line_i == selection.line {
+                            // A previous line index different to the current means that the current line follows a hard break
+                            if prev_line_index != line.line_i {
+                                if selection.index <= line_length {
+                                    selection_anchor_line = line_node.node_id();
+                                    selection_anchor_cursor = selection.index;
+                                }
+                            } else if selection.index > current_cursor {
+                                selection_anchor_line = line_node.node_id();
+                                selection_anchor_cursor = selection.index - current_cursor;
+                            }
+                        }
+                    }
+
+                    node.add_child(line_node);
+
+                    current_cursor += line_length;
+                    prev_line_index = line.line_i;
                 }
 
-                node.add_child(line_node);
+                node.set_text_selection(TextSelection {
+                    anchor: TextPosition {
+                        node: selection_anchor_line,
+                        character_index: selection_anchor_cursor,
+                    },
+                    focus: TextPosition {
+                        node: selection_active_line,
+                        character_index: selection_active_cursor,
+                    },
+                });
 
-                current_cursor += line_length;
-                prev_line_index = line.line_i;
-            }
-
-            node.set_text_selection(TextSelection {
-                anchor: TextPosition {
-                    node: selection_anchor_line,
-                    character_index: selection_anchor_cursor,
-                },
-                focus: TextPosition {
-                    node: selection_active_line,
-                    character_index: selection_active_cursor,
-                },
+                node.node_builder.set_default_action_verb(DefaultActionVerb::Focus);
             });
-
-            node.node_builder.set_default_action_verb(DefaultActionVerb::Focus);
         });
     }
 
@@ -962,32 +964,35 @@ where
                     let mut current_cursor = 0;
                     let mut prev_line_index = std::usize::MAX;
 
-                    for (index, line) in editor.buffer().layout_runs().enumerate() {
-                        let line_node = AccessNode::new_from_parent(node_id, index);
-                        // if line_node.node_id() == cursor_node {
-                        //     cursor_line_index = line.line_i;
-                        //     cursor_index = selection.focus.character_index + current_cursor;
-                        // }
+                    editor.with_buffer(|buffer| {
+                        for (index, line) in buffer.layout_runs().enumerate() {
+                            let line_node = AccessNode::new_from_parent(node_id, index);
+                            // if line_node.node_id() == cursor_node {
+                            //     cursor_line_index = line.line_i;
+                            //     cursor_index = selection.focus.character_index + current_cursor;
+                            // }
 
-                        if line_node.node_id() == selection_node {
-                            selection_line_index = line.line_i;
-                            selection_index = selection.anchor.character_index + current_cursor;
+                            if line_node.node_id() == selection_node {
+                                selection_line_index = line.line_i;
+                                selection_index = selection.anchor.character_index + current_cursor;
+                            }
+
+                            if line.line_i != prev_line_index {
+                                current_cursor = 0;
+                            }
+
+                            let first_glyph_pos =
+                                line.glyphs.first().map(|glyph| glyph.start).unwrap_or_default();
+                            let last_glyph_pos =
+                                line.glyphs.last().map(|glyph| glyph.end).unwrap_or_default();
+
+                            let line_length = last_glyph_pos - first_glyph_pos;
+
+                            current_cursor += line_length;
+                            prev_line_index = line.line_i;
                         }
 
-                        if line.line_i != prev_line_index {
-                            current_cursor = 0;
-                        }
-
-                        let first_glyph_pos =
-                            line.glyphs.first().map(|glyph| glyph.start).unwrap_or_default();
-                        let last_glyph_pos =
-                            line.glyphs.last().map(|glyph| glyph.end).unwrap_or_default();
-
-                        let line_length = last_glyph_pos - first_glyph_pos;
-
-                        current_cursor += line_length;
-                        prev_line_index = line.line_i;
-                    }
+                    });
 
                     let selection_cursor = Cursor::new(selection_line_index, selection_index);
                     editor.set_selection(Selection::Normal(selection_cursor));

@@ -212,7 +212,7 @@ impl Node for Entity {
 
             let (text_width, mut text_height) =
                 sublayout.text_context.with_buffer(*self, |fs, buffer| {
-                    buffer.set_size(fs, max_width as f32, f32::MAX);
+                    buffer.set_size(fs, Some(max_width as f32), Some(f32::MAX));
 
                     let w = buffer
                         .layout_runs()
@@ -227,7 +227,7 @@ impl Node for Entity {
 
             if height.is_none() {
                 text_height = sublayout.text_context.with_buffer(*self, |fs, buffer| {
-                    buffer.set_size(fs, text_width, f32::MAX);
+                    buffer.set_size(fs, Some(text_width), Some(f32::MAX));
 
                     let lines = buffer.layout_runs().count();
                     lines as f32 * buffer.metrics().line_height

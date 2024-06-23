@@ -17,6 +17,7 @@ use femtovg::{
 use hashbrown::HashMap;
 use morphorm::Units;
 use std::cmp::Ordering;
+use std::usize;
 use swash::scale::image::Content;
 use swash::scale::{Render, ScaleContext, Source, StrikeWith};
 use swash::zeno::{Format, Vector};
@@ -39,7 +40,7 @@ pub struct TextContext {
     scale_context: ScaleContext,
     rendered_glyphs: HashMap<CacheKey, Option<RenderedGlyph>>,
     glyph_textures: Vec<FontTexture>,
-    buffers: HashMap<Entity, Editor>,
+    buffers: HashMap<Entity, Editor<'static>>,
     bounds: SparseSet<BoundingBox>,
 }
 
@@ -80,7 +81,7 @@ impl TextContext {
         entity: Entity,
         f: impl FnOnce(&mut FontSystem, &mut Buffer) -> O,
     ) -> O {
-        self.with_editor(entity, |fs, ed| f(fs, ed.buffer_mut()))
+        self.with_editor(entity, |fs, ed| ed.with_buffer_mut(|b|  f(fs, b)))
     }
 
     pub(crate) fn set_bounds(&mut self, entity: Entity, size: BoundingBox) {
@@ -209,7 +210,8 @@ impl TextContext {
             buf.set_metrics(fs, Metrics::new(font_size, font_size * 1.2));
             // buf.set_size(fs, 200.0, 200.0);
             // buf.shape_until_scroll(fs);
-            buf.shape_until(fs, i32::MAX);
+            //buf.shape_until(fs, i32::MAX);
+            buf.shape_until_scroll(fs, true);
         });
     }
 
@@ -226,187 +228,188 @@ impl TextContext {
             return Ok(vec![]);
         }
 
-        let buffer = self.buffers.get_mut(&entity).unwrap().buffer_mut();
+        self.buffers.get_mut(&entity).unwrap().with_buffer_mut(|buffer| {
+            let mut alpha_cmd_map = HashMap::new();
+            let mut color_cmd_map = HashMap::new();
 
-        let mut alpha_cmd_map = HashMap::new();
-        let mut color_cmd_map = HashMap::new();
+            let lines = buffer.layout_runs().filter(|run| run.line_w != 0.0).count();
+            let total_height = lines as f32 * buffer.metrics().line_height;
+            for run in buffer.layout_runs() {
+                for glyph in run.glyphs {
+                    let physical_glyph = glyph.physical(
+                        (bounds.x, bounds.y + bounds.h * justify.1 - total_height * justify.1),
+                        1.0,
+                    );
+                    let cache_key = physical_glyph.cache_key;
 
-        let lines = buffer.layout_runs().filter(|run| run.line_w != 0.0).count();
-        let total_height = lines as f32 * buffer.metrics().line_height;
-        for run in buffer.layout_runs() {
-            for glyph in run.glyphs {
-                let physical_glyph = glyph.physical(
-                    (bounds.x, bounds.y + bounds.h * justify.1 - total_height * justify.1),
-                    1.0,
-                );
-                let cache_key = physical_glyph.cache_key;
+                    // perform cache lookup for rendered glyph
+                    let Some(rendered) = self.rendered_glyphs.entry(cache_key).or_insert_with(|| {
+                        // ...or insert it
 
-                // perform cache lookup for rendered glyph
-                let Some(rendered) = self.rendered_glyphs.entry(cache_key).or_insert_with(|| {
-                    // ...or insert it
+                        // do the actual rasterization
+                        let font = self
+                            .font_system
+                            .get_font(cache_key.font_id)
+                            .expect("Somehow shaped a font that doesn't exist");
+                        let mut scaler = self
+                            .scale_context
+                            .builder(font.as_swash())
+                            .size(f32::from_bits(cache_key.font_size_bits))
+                            .hint(config.hint)
+                            .build();
+                        let offset =
+                            Vector::new(cache_key.x_bin.as_float(), cache_key.y_bin.as_float());
+                        let image = Render::new(&[
+                            Source::ColorOutline(0),
+                            Source::ColorBitmap(StrikeWith::BestFit),
+                            Source::Outline,
+                        ])
+                            .format(if config.subpixel { Format::Subpixel } else { Format::Alpha })
+                            .offset(offset)
+                            .render(&mut scaler, cache_key.glyph_id);
 
-                    // do the actual rasterization
-                    let font = self
-                        .font_system
-                        .get_font(cache_key.font_id)
-                        .expect("Somehow shaped a font that doesn't exist");
-                    let mut scaler = self
-                        .scale_context
-                        .builder(font.as_swash())
-                        .size(f32::from_bits(cache_key.font_size_bits))
-                        .hint(config.hint)
-                        .build();
-                    let offset =
-                        Vector::new(cache_key.x_bin.as_float(), cache_key.y_bin.as_float());
-                    let image = Render::new(&[
-                        Source::ColorOutline(0),
-                        Source::ColorBitmap(StrikeWith::BestFit),
-                        Source::Outline,
-                    ])
-                    .format(if config.subpixel { Format::Subpixel } else { Format::Alpha })
-                    .offset(offset)
-                    .render(&mut scaler, cache_key.glyph_id);
-
-                    // upload it to the GPU
-                    image.map(|image| {
-                        // pick an atlas texture for our glyph
-                        let content_w = image.placement.width as usize;
-                        let content_h = image.placement.height as usize;
-                        let alloc_w = image.placement.width + (GLYPH_MARGIN + GLYPH_PADDING) * 2;
-                        let alloc_h = image.placement.height + (GLYPH_MARGIN + GLYPH_PADDING) * 2;
-                        let used_w = image.placement.width + GLYPH_PADDING * 2;
-                        let used_h = image.placement.height + GLYPH_PADDING * 2;
-                        let mut found = None;
-                        for (texture_index, glyph_atlas) in
-                            self.glyph_textures.iter_mut().enumerate()
-                        {
-                            if let Some((x, y)) =
-                                glyph_atlas.atlas.add_rect(alloc_w as usize, alloc_h as usize)
+                        // upload it to the GPU
+                        image.map(|image| {
+                            // pick an atlas texture for our glyph
+                            let content_w = image.placement.width as usize;
+                            let content_h = image.placement.height as usize;
+                            let alloc_w = image.placement.width + (GLYPH_MARGIN + GLYPH_PADDING) * 2;
+                            let alloc_h = image.placement.height + (GLYPH_MARGIN + GLYPH_PADDING) * 2;
+                            let used_w = image.placement.width + GLYPH_PADDING * 2;
+                            let used_h = image.placement.height + GLYPH_PADDING * 2;
+                            let mut found = None;
+                            for (texture_index, glyph_atlas) in
+                                self.glyph_textures.iter_mut().enumerate()
                             {
-                                found = Some((texture_index, x, y));
-                                break;
+                                if let Some((x, y)) =
+                                    glyph_atlas.atlas.add_rect(alloc_w as usize, alloc_h as usize)
+                                {
+                                    found = Some((texture_index, x, y));
+                                    break;
+                                }
                             }
-                        }
-                        let (texture_index, atlas_alloc_x, atlas_alloc_y) =
-                            found.unwrap_or_else(|| {
-                                // if no atlas could fit the texture, make a new atlas tyvm
-                                // TODO error handling
-                                let mut atlas = Atlas::new(TEXTURE_SIZE, TEXTURE_SIZE);
-                                let image_id = canvas
-                                    .create_image(
-                                        Img::new(
-                                            vec![
-                                                RGBA8::new(0, 0, 0, 0);
-                                                TEXTURE_SIZE * TEXTURE_SIZE
-                                            ],
-                                            TEXTURE_SIZE,
-                                            TEXTURE_SIZE,
+                            let (texture_index, atlas_alloc_x, atlas_alloc_y) =
+                                found.unwrap_or_else(|| {
+                                    // if no atlas could fit the texture, make a new atlas tyvm
+                                    // TODO error handling
+                                    let mut atlas = Atlas::new(TEXTURE_SIZE, TEXTURE_SIZE);
+                                    let image_id = canvas
+                                        .create_image(
+                                            Img::new(
+                                                vec![
+                                                    RGBA8::new(0, 0, 0, 0);
+                                                    TEXTURE_SIZE * TEXTURE_SIZE
+                                                ],
+                                                TEXTURE_SIZE,
+                                                TEXTURE_SIZE,
+                                            )
+                                                .as_ref(),
+                                            ImageFlags::empty(),
                                         )
-                                        .as_ref(),
-                                        ImageFlags::empty(),
-                                    )
-                                    .unwrap();
-                                let texture_index = self.glyph_textures.len();
-                                let (x, y) =
-                                    atlas.add_rect(alloc_w as usize, alloc_h as usize).unwrap();
-                                self.glyph_textures.push(FontTexture { atlas, image_id });
-                                (texture_index, x, y)
-                            });
+                                        .unwrap();
+                                    let texture_index = self.glyph_textures.len();
+                                    let (x, y) =
+                                        atlas.add_rect(alloc_w as usize, alloc_h as usize).unwrap();
+                                    self.glyph_textures.push(FontTexture { atlas, image_id });
+                                    (texture_index, x, y)
+                                });
 
-                        let atlas_used_x = atlas_alloc_x as u32 + GLYPH_MARGIN;
-                        let atlas_used_y = atlas_alloc_y as u32 + GLYPH_MARGIN;
-                        let atlas_content_x = atlas_alloc_x as u32 + GLYPH_MARGIN + GLYPH_PADDING;
-                        let atlas_content_y = atlas_alloc_y as u32 + GLYPH_MARGIN + GLYPH_PADDING;
+                            let atlas_used_x = atlas_alloc_x as u32 + GLYPH_MARGIN;
+                            let atlas_used_y = atlas_alloc_y as u32 + GLYPH_MARGIN;
+                            let atlas_content_x = atlas_alloc_x as u32 + GLYPH_MARGIN + GLYPH_PADDING;
+                            let atlas_content_y = atlas_alloc_y as u32 + GLYPH_MARGIN + GLYPH_PADDING;
 
-                        let mut src_buf = Vec::with_capacity(content_w * content_h);
-                        match image.content {
-                            Content::Mask => {
-                                for chunk in image.data.chunks_exact(1) {
-                                    src_buf.push(RGBA8::new(chunk[0], 0, 0, 0));
+                            let mut src_buf = Vec::with_capacity(content_w * content_h);
+                            match image.content {
+                                Content::Mask => {
+                                    for chunk in image.data.chunks_exact(1) {
+                                        src_buf.push(RGBA8::new(chunk[0], 0, 0, 0));
+                                    }
+                                }
+                                Content::Color | Content::SubpixelMask => {
+                                    for chunk in image.data.chunks_exact(4) {
+                                        src_buf
+                                            .push(RGBA8::new(chunk[0], chunk[1], chunk[2], chunk[3]));
+                                    }
                                 }
                             }
-                            Content::Color | Content::SubpixelMask => {
-                                for chunk in image.data.chunks_exact(4) {
-                                    src_buf
-                                        .push(RGBA8::new(chunk[0], chunk[1], chunk[2], chunk[3]));
-                                }
+                            canvas
+                                .update_image::<ImageSource>(
+                                    self.glyph_textures[texture_index].image_id,
+                                    ImgRef::new(&src_buf, content_w, content_h).into(),
+                                    atlas_content_x as usize,
+                                    atlas_content_y as usize,
+                                )
+                                .unwrap();
+                            RenderedGlyph {
+                                texture_index,
+                                width: used_w,
+                                height: used_h,
+                                offset_x: image.placement.left,
+                                offset_y: image.placement.top,
+                                atlas_x: atlas_used_x,
+                                atlas_y: atlas_used_y,
+                                color_glyph: matches!(image.content, Content::Color),
                             }
-                        }
-                        canvas
-                            .update_image::<ImageSource>(
-                                self.glyph_textures[texture_index].image_id,
-                                ImgRef::new(&src_buf, content_w, content_h).into(),
-                                atlas_content_x as usize,
-                                atlas_content_y as usize,
-                            )
-                            .unwrap();
-                        RenderedGlyph {
-                            texture_index,
-                            width: used_w,
-                            height: used_h,
-                            offset_x: image.placement.left,
-                            offset_y: image.placement.top,
-                            atlas_x: atlas_used_x,
-                            atlas_y: atlas_used_y,
-                            color_glyph: matches!(image.content, Content::Color),
-                        }
-                    })
-                }) else {
-                    continue;
-                };
+                        })
+                    }) else {
+                        continue;
+                    };
 
-                let cmd_map = if rendered.color_glyph {
-                    &mut color_cmd_map
-                } else {
-                    alpha_cmd_map
-                        .entry(glyph.color_opt.unwrap_or(FontColor::rgb(0, 0, 0)))
-                        .or_insert_with(HashMap::default)
-                };
+                    let cmd_map = if rendered.color_glyph {
+                        &mut color_cmd_map
+                    } else {
+                        alpha_cmd_map
+                            .entry(glyph.color_opt.unwrap_or(FontColor::rgb(0, 0, 0)))
+                            .or_insert_with(HashMap::default)
+                    };
 
-                let cmd = cmd_map.entry(rendered.texture_index).or_insert_with(|| DrawCommand {
-                    image_id: self.glyph_textures[rendered.texture_index].image_id,
-                    quads: Vec::new(),
-                });
+                    let cmd = cmd_map.entry(rendered.texture_index).or_insert_with(|| DrawCommand {
+                        image_id: self.glyph_textures[rendered.texture_index].image_id,
+                        quads: Vec::new(),
+                    });
 
-                let mut q = Quad::default();
-                let it = 1.0 / TEXTURE_SIZE as f32;
-                q.x0 = (physical_glyph.x + rendered.offset_x - GLYPH_PADDING as i32) as f32;
-                q.y0 = (physical_glyph.y - rendered.offset_y - GLYPH_PADDING as i32
-                    + run.line_y.round() as i32) as f32;
-                q.x1 = q.x0 + rendered.width as f32;
-                q.y1 = q.y0 + rendered.height as f32;
+                    let mut q = Quad::default();
+                    let it = 1.0 / TEXTURE_SIZE as f32;
+                    q.x0 = (physical_glyph.x + rendered.offset_x - GLYPH_PADDING as i32) as f32;
+                    q.y0 = (physical_glyph.y - rendered.offset_y - GLYPH_PADDING as i32
+                        + run.line_y.round() as i32) as f32;
+                    q.x1 = q.x0 + rendered.width as f32;
+                    q.y1 = q.y0 + rendered.height as f32;
 
-                q.s0 = rendered.atlas_x as f32 * it;
-                q.t0 = rendered.atlas_y as f32 * it;
-                q.s1 = (rendered.atlas_x + rendered.width) as f32 * it;
-                q.t1 = (rendered.atlas_y + rendered.height) as f32 * it;
+                    q.s0 = rendered.atlas_x as f32 * it;
+                    q.t0 = rendered.atlas_y as f32 * it;
+                    q.s1 = (rendered.atlas_x + rendered.width) as f32 * it;
+                    q.t1 = (rendered.atlas_y + rendered.height) as f32 * it;
 
-                cmd.quads.push(q);
+                    cmd.quads.push(q);
+                }
             }
-        }
 
-        if !alpha_cmd_map.is_empty() {
-            Ok(alpha_cmd_map
-                .into_iter()
-                .map(|(color, map)| {
-                    (
-                        color,
-                        GlyphDrawCommands {
-                            alpha_glyphs: map.into_values().collect(),
-                            color_glyphs: color_cmd_map.drain().map(|(_, cmd)| cmd).collect(),
-                        },
-                    )
-                })
-                .collect())
-        } else {
-            Ok(vec![(
-                FontColor(0),
-                GlyphDrawCommands {
-                    alpha_glyphs: vec![],
-                    color_glyphs: color_cmd_map.drain().map(|(_, cmd)| cmd).collect(),
-                },
-            )])
-        }
+            if !alpha_cmd_map.is_empty() {
+                Ok(alpha_cmd_map
+                    .into_iter()
+                    .map(|(color, map)| {
+                        (
+                            color,
+                            GlyphDrawCommands {
+                                alpha_glyphs: map.into_values().collect(),
+                                color_glyphs: color_cmd_map.drain().map(|(_, cmd)| cmd).collect(),
+                            },
+                        )
+                    })
+                    .collect())
+            } else {
+                Ok(vec![(
+                    FontColor(0),
+                    GlyphDrawCommands {
+                        alpha_glyphs: vec![],
+                        color_glyphs: color_cmd_map.drain().map(|(_, cmd)| cmd).collect(),
+                    },
+                )])
+            }
+
+        })
     }
 
     pub(crate) fn layout_selection(
@@ -424,18 +427,19 @@ impl TextContext {
                     Ordering::Equal => return result,
                 };
 
-                let buffer = buf.buffer();
-                let total_height = buffer.layout_runs().len() as f32 * buffer.metrics().line_height;
+                buf.with_buffer(|buffer| {
+                    let total_height = buffer.layout_runs().count() as f32 * buffer.metrics().line_height;
 
-                for run in buffer.layout_runs() {
-                    if let Some((x, w)) = run.highlight(cursor_start, cursor_end) {
-                        let y = run.line_y - buffer.metrics().font_size;
-                        let x = x + bounds.x;
+                    for run in buffer.layout_runs() {
+                        if let Some((x, w)) = run.highlight(cursor_start, cursor_end) {
+                            let y = run.line_y - buffer.metrics().font_size;
+                            let x = x + bounds.x;
 
-                        let y = y + bounds.y + bounds.h * justify.1 - total_height * justify.1;
-                        result.push((x, y, w, buffer.metrics().line_height));
+                            let y = y + bounds.y + bounds.h * justify.1 - total_height * justify.1;
+                            result.push((x, y, w, buffer.metrics().line_height));
+                        }
                     }
-                }
+                });
             }
             result
         })
@@ -449,84 +453,85 @@ impl TextContext {
         width: f32,
     ) -> Option<(f32, f32, f32, f32)> {
         self.with_editor(entity, |_, buf| {
-            let buffer = buf.buffer();
-            let total_height = buffer.layout_runs().len() as f32 * buffer.metrics().line_height;
+            buf.with_buffer(|buffer| {
+                let total_height = buffer.layout_runs().count() as f32 * buffer.metrics().line_height;
 
-            let position_y = bounds.y + bounds.h * justify.1 - total_height * justify.1;
+                let position_y = bounds.y + bounds.h * justify.1 - total_height * justify.1;
 
-            let line_height = buffer.metrics().line_height;
+                let line_height = buffer.metrics().line_height;
 
-            for run in buffer.layout_runs() {
-                let line_i = run.line_i;
+                for run in buffer.layout_runs() {
+                    let line_i = run.line_i;
 
-                let position_x = bounds.x;
+                    let position_x = bounds.x;
 
-                let cursor_glyph_opt = |cursor: &Cursor| -> Option<(usize, f32)> {
-                    if cursor.line == line_i {
-                        for (glyph_i, glyph) in run.glyphs.iter().enumerate() {
-                            if cursor.index == glyph.start {
-                                return Some((glyph_i, 0.0));
-                            } else if cursor.index > glyph.start && cursor.index < glyph.end {
-                                // Guess x offset based on characters
-                                let mut before = 0;
-                                let mut total = 0;
+                    let cursor_glyph_opt = |cursor: &Cursor| -> Option<(usize, f32)> {
+                        if cursor.line == line_i {
+                            for (glyph_i, glyph) in run.glyphs.iter().enumerate() {
+                                if cursor.index == glyph.start {
+                                    return Some((glyph_i, 0.0));
+                                } else if cursor.index > glyph.start && cursor.index < glyph.end {
+                                    // Guess x offset based on characters
+                                    let mut before = 0;
+                                    let mut total = 0;
 
-                                let cluster = &run.text[glyph.start..glyph.end];
-                                for (i, _) in cluster.grapheme_indices(true) {
-                                    if glyph.start + i < cursor.index {
-                                        before += 1;
+                                    let cluster = &run.text[glyph.start..glyph.end];
+                                    for (i, _) in cluster.grapheme_indices(true) {
+                                        if glyph.start + i < cursor.index {
+                                            before += 1;
+                                        }
+                                        total += 1;
                                     }
-                                    total += 1;
-                                }
 
-                                let offset = glyph.w * (before as f32) / (total as f32);
-                                return Some((glyph_i, offset));
-                            }
-                        }
-                        match run.glyphs.last() {
-                            Some(glyph) => {
-                                if cursor.index == glyph.end {
-                                    return Some((run.glyphs.len(), 0.0));
+                                    let offset = glyph.w * (before as f32) / (total as f32);
+                                    return Some((glyph_i, offset));
                                 }
                             }
-                            None => {
-                                return Some((0, 0.0));
-                            }
-                        }
-                    }
-                    None
-                };
-
-                if let Some((cursor_glyph, cursor_glyph_offset)) = cursor_glyph_opt(&buf.cursor()) {
-                    let x = match run.glyphs.get(cursor_glyph) {
-                        Some(glyph) => {
-                            // Start of detected glyph
-                            if glyph.level.is_rtl() {
-                                glyph.x + glyph.w - cursor_glyph_offset
-                            } else {
-                                glyph.x + cursor_glyph_offset
-                            }
-                        }
-                        None => match run.glyphs.last() {
-                            Some(glyph) => {
-                                // End of last glyph
-                                if glyph.level.is_rtl() {
-                                    glyph.x
-                                } else {
-                                    glyph.x + glyph.w
+                            match run.glyphs.last() {
+                                Some(glyph) => {
+                                    if cursor.index == glyph.end {
+                                        return Some((run.glyphs.len(), 0.0));
+                                    }
+                                }
+                                None => {
+                                    return Some((0, 0.0));
                                 }
                             }
-                            None => {
-                                // Start of empty line
-                                0.0
-                            }
-                        },
+                        }
+                        None
                     };
 
-                    return Some((position_x + x, position_y + run.line_top, width, line_height));
+                    if let Some((cursor_glyph, cursor_glyph_offset)) = cursor_glyph_opt(&buf.cursor()) {
+                        let x = match run.glyphs.get(cursor_glyph) {
+                            Some(glyph) => {
+                                // Start of detected glyph
+                                if glyph.level.is_rtl() {
+                                    glyph.x + glyph.w - cursor_glyph_offset
+                                } else {
+                                    glyph.x + cursor_glyph_offset
+                                }
+                            }
+                            None => match run.glyphs.last() {
+                                Some(glyph) => {
+                                    // End of last glyph
+                                    if glyph.level.is_rtl() {
+                                        glyph.x
+                                    } else {
+                                        glyph.x + glyph.w
+                                    }
+                                }
+                                None => {
+                                    // Start of empty line
+                                    0.0
+                                }
+                            },
+                        };
+
+                        return Some((position_x + x, position_y + run.line_top, width, line_height));
+                    }
                 }
-            }
-            None
+                None
+            })
         })
     }
 }
