@@ -557,7 +557,7 @@ where
             let mut selection_anchor_cursor = 0;
 
             let mut current_cursor = 0;
-            let mut prev_line_index = std::usize::MAX;
+            let mut prev_line_index = usize::MAX;
 
             editor.with_buffer(|buffer| {
                 for (index, line) in buffer.layout_runs().enumerate() {
@@ -962,7 +962,7 @@ where
                     let mut selection_index = 0;
 
                     let mut current_cursor = 0;
-                    let mut prev_line_index = std::usize::MAX;
+                    let mut prev_line_index = usize::MAX;
 
                     editor.with_buffer(|buffer| {
                         for (index, line) in buffer.layout_runs().enumerate() {
